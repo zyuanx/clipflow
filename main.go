@@ -1,90 +1,193 @@
 package main
 
 import (
-	"flag"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
-	"image"
+	"log"
 	"net"
-	"os"
 
-	_ "image/jpeg" // 导入JPEG格式支持
-	_ "image/png"  // 导入PNG格式支持
-
-	"github.com/zyuanx/clipflow/client"
-	"github.com/zyuanx/clipflow/server"
 	"golang.design/x/clipboard"
+	"golang.org/x/net/ipv4"
 )
 
-func GetClientIPs() ([]*net.IPNet, error) {
-	addrs, err := net.InterfaceAddrs()
+const (
+	multicastAddr = "224.0.1.251"
+	multicastPort = 5352
+)
 
+var recvMsg []byte
+
+type MessageType int
+
+const (
+	MSG_TYPE_TEXT MessageType = iota + 1
+	MSG_TYPE_IMAGE
+)
+
+type Message struct {
+	MsgType MessageType
+	Msg     []byte
+}
+
+const (
+	MSG_LENGTH = 8
+	MSG_BUF    = 1024
+)
+
+var LocalIP = ""
+
+func init() {
+	err := clipboard.Init()
 	if err != nil {
-		return nil, err
+		log.Panicln(err)
 	}
-	var ips []*net.IPNet
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		fmt.Println("Error getting interface addresses:", err)
+		return
+	}
 
-	for _, address := range addrs {
-		// 检查ip地址判断是否回环地址
-		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
-				ips = append(ips, ipnet)
+				LocalIP = ipnet.IP.String()
 			}
 		}
 	}
-
-	return ips, nil
+	log.Printf("Server start in %s\n", LocalIP)
 }
 
-func readImage() []byte {
-	file, err := os.Open("test.jpg")
-	if err != nil {
-		fmt.Println("无法打开图片文件:", err)
-	}
-	defer file.Close()
-
-	// 解码图片
-	img, _, err := image.Decode(file)
-	if err != nil {
-		fmt.Println("无法解码图片:", err)
-	}
-
-	// 将图片转换为RGBA格式
-	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-	rgba := image.NewRGBA(bounds)
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			rgba.Set(x, y, img.At(x, y))
+func listenClipboard(conn *net.UDPConn, addr net.Addr) {
+	ch1 := clipboard.Watch(context.TODO(), clipboard.FmtText)
+	ch2 := clipboard.Watch(context.TODO(), clipboard.FmtImage)
+	go func() {
+		for {
+			select {
+			case <-ch1:
+				ret := clipboard.Read(clipboard.FmtText)
+				if bytes.Equal(ret, recvMsg) {
+					continue
+				}
+				msg := Message{
+					MsgType: MSG_TYPE_TEXT,
+					Msg:     ret,
+				}
+				sendMessage(conn, addr, msg)
+			case <-ch2:
+				ret := clipboard.Read(clipboard.FmtImage)
+				if bytes.Equal(ret, recvMsg) {
+					continue
+				}
+				msg := Message{
+					MsgType: MSG_TYPE_IMAGE,
+					Msg:     ret,
+				}
+				sendMessage(conn, addr, msg)
+			}
 		}
-	}
-
-	// 将RGBA格式的图片转换为[]byte
-	rgbData := rgba.Pix
-
-	// 打印图片数据长度和内容
-	fmt.Println("图片数据长度:", len(rgbData))
-	fmt.Println("图片数据内容:", rgbData)
-	return rgbData
+	}()
 }
 
-var peer = flag.String("p", "server", "server or client")
+func sendMessage(conn *net.UDPConn, addr net.Addr, msg Message) {
+
+	messageBytes, _ := json.Marshal(msg)
+	messageLength := len(messageBytes)
+	lengthBytes := make([]byte, MSG_LENGTH)
+	binary.BigEndian.PutUint32(lengthBytes, uint32(messageLength))
+	messageWithLength := append(lengthBytes, messageBytes...)
+	for len(messageWithLength) > 0 {
+		mi := min(MSG_BUF, len(messageWithLength))
+		buf := messageWithLength[:mi]
+		_, _, err := conn.WriteMsgUDP(buf, nil, addr.(*net.UDPAddr))
+		if err != nil {
+			log.Printf("Write failed, %v\n", err)
+		}
+		messageWithLength = messageWithLength[mi:]
+	}
+}
+
+func receiveMessage(conn *net.UDPConn, name string) {
+	receivedData := []byte{}
+	for {
+		buf := make([]byte, MSG_BUF)
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("Read error, %v\n", err)
+		}
+		if addr.IP.String() == LocalIP {
+			continue
+		}
+		receivedData = append(receivedData, buf[:n]...)
+
+		for {
+			if len(receivedData) < MSG_LENGTH {
+				break
+			}
+			messageLength := int(binary.BigEndian.Uint32(receivedData[:MSG_LENGTH]))
+			if len(receivedData) < MSG_LENGTH+messageLength {
+				break
+			}
+
+			messageBytes := receivedData[MSG_LENGTH : MSG_LENGTH+messageLength]
+
+			var msg Message
+			if err := json.Unmarshal(messageBytes, &msg); err != nil {
+				fmt.Println("Error deserializing message:", err)
+			} else {
+				recvMsg = msg.Msg
+				switch msg.MsgType {
+				case MSG_TYPE_TEXT:
+					clipboard.Write(clipboard.FmtText, recvMsg)
+				case MSG_TYPE_IMAGE:
+					clipboard.Write(clipboard.FmtImage, recvMsg)
+				}
+				log.Printf("Received from multicast group(%s, %s)\n", addr, name)
+			}
+			receivedData = receivedData[MSG_LENGTH+messageLength:]
+		}
+
+	}
+}
 
 func main() {
-	// Init returns an error if the package is not ready for use.
-	err := clipboard.Init()
+	ipv4Addr := &net.UDPAddr{IP: net.ParseIP(multicastAddr), Port: multicastPort}
+	conn, err := net.ListenUDP("udp4", ipv4Addr)
 	if err != nil {
-		panic(err)
+		log.Fatalf("ListenUDP error %v\n", err)
 	}
-	// text := clipboard.Read(clipboard.FmtText)
-	// fmt.Println(string(text))
 
-	clipboard.Write(clipboard.FmtImage, readImage())
-	flag.Parse()
-	fmt.Println("peer:", *peer)
-	if *peer == "server" {
-		server.Server()
-	} else {
-		client.Client()
+	pc := ipv4.NewPacketConn(conn)
+	inter, err := net.Interfaces()
+	if err != nil {
+		log.Fatalf("Get interface error %v\n", err)
 	}
+	for _, v := range inter {
+		ifi, err := net.InterfaceByName(v.Name)
+		if err != nil {
+			log.Printf("can't find specified interface %v\n", err)
+			continue
+		}
+		if err := pc.JoinGroup(ifi, &net.UDPAddr{IP: net.ParseIP(multicastAddr)}); err != nil {
+			log.Printf("JointGroup error %v\n", err)
+			continue
+		}
+
+		if loop, err := pc.MulticastLoopback(); err == nil {
+			if !loop {
+				if err := pc.SetMulticastLoopback(true); err != nil {
+					log.Printf("SetMulticastLoopback error: %v\n", err)
+				}
+			}
+		}
+
+		// go sendMessage(conn, ipv4Addr)
+		go listenClipboard(conn, ipv4Addr)
+
+		go receiveMessage(conn, v.Name)
+	}
+	select {}
+
 }
